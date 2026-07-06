@@ -9,7 +9,7 @@
  * How it works:
  * 1. After each agent_end, fetches spans from Phoenix for the last trace
  * 2. Builds a conversation transcript from span attributes
- * 3. Sends transcript to LLM (via OpenCode API) for behavioral analysis
+ * 3. Sends transcript to LLM (user's current model) for behavioral analysis
  * 4. Extracts structured lessons and stores in ~/.pi/agent/pi-lessons.json
  * 5. Before each agent_start, injects relevant lessons into system prompt
  *
@@ -18,9 +18,11 @@
  *   /learn          – ručně spustí analýzu posledních traceů
  *   /forget-lesson  – smaže lesson (podle ID nebo --all)
  *   /review         – analyzuje poslední konverzaci z aktuální session
+ *
+ * Provider-agnostic: používá model, který má uživatel právě aktivní v pi.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Model } from "@earendil-works/pi-coding-agent";
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -34,10 +36,6 @@ const PHOENIX_HOST = process.env.PHOENIX_HOST || "http://localhost:6006";
 const PHOENIX_PROJECT = process.env.PHOENIX_PROJECT || "pi";
 const MAX_LESSONS = 50;
 const MAX_LESSONS_IN_PROMPT = 8;
-
-// OpenCode API for LLM analysis
-const OPENCODE_API_BASE = "https://opencode.ai/zen/v1";
-const ANALYSIS_MODEL = process.env.PHOENIX_LEARNER_MODEL || "deepseek-v4-flash-free";
 
 // =============================================================================
 // Lesson Storage
@@ -92,7 +90,6 @@ function saveLessons(lessons: Lesson[]): void {
   }
 }
 
-/** Normalize lesson text to create a stable fingerprint */
 function lessonFingerprint(summary: string): string {
   return summary
     .toLowerCase()
@@ -108,7 +105,6 @@ function findMatchingLesson(lessons: Lesson[], summary: string): Lesson | undefi
   return lessons.find((l) => {
     const lfp = lessonFingerprint(l.summary);
     if (lfp === fp) return true;
-    // One contains the other
     if (lfp.includes(fp) || fp.includes(lfp)) return true;
     return false;
   });
@@ -174,16 +170,6 @@ async function fetchSpans(): Promise<PHSpan[]> {
   } catch { return []; }
 }
 
-async function fetchTraces(): Promise<any[]> {
-  try {
-    const url = `${PHOENIX_HOST}/v1/projects/${encodeURIComponent(PHOENIX_PROJECT)}/traces`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return [];
-    const data = (await res.json()) as { data: any[] };
-    return data.data ?? [];
-  } catch { return []; }
-}
-
 // =============================================================================
 // Conversation Reconstruction from Spans
 // =============================================================================
@@ -229,10 +215,8 @@ function buildConversation(spans: PHSpan[]): ConversationAnalysis | null {
       .map((tool) => ({
         toolName: tool.attributes?.["pi.tool_name"] ?? "unknown",
         args: (() => {
-          try {
-            const raw = tool.attributes?.["pi.tool_args"];
-            return raw ? JSON.parse(raw) : {};
-          } catch { return {}; }
+          try { return JSON.parse(tool.attributes?.["pi.tool_args"] ?? "{}"); }
+          catch { return {}; }
         })(),
         output: tool.attributes?.["pi.tool_output"] ?? "",
         isError: tool.status_code === "ERROR",
@@ -240,14 +224,13 @@ function buildConversation(spans: PHSpan[]): ConversationAnalysis | null {
 
     turns.push({
       turnIndex,
-      prompt: turnIndex === 0 ? prompt : "[pokračování z předchozího turnu]",
+      prompt: turnIndex === 0 ? prompt : "[pokračování]",
       assistantResponse: ts.attributes?.["pi.assistant_response"] ?? "",
       toolCalls,
       tokenCount: ts.attributes?.["openinference.llm.token_count.total"] ?? 0,
     });
   }
 
-  // Build a readable transcript
   const lines: string[] = [`## Konverzace (trace: ${traceId.slice(0, 12)}...)`];
   lines.push(`**Zadání:** ${prompt}`);
   lines.push("");
@@ -267,33 +250,188 @@ function buildConversation(spans: PHSpan[]): ConversationAnalysis | null {
     }
   }
 
-  return {
-    traceId,
-    turns,
-    fullTranscript: lines.join("\n"),
-  };
+  return { traceId, turns, fullTranscript: lines.join("\n") };
 }
 
 // =============================================================================
-// LLM Analysis via OpenCode API
+// Provider-agnostic LLM caller
 // =============================================================================
 
-function getApiKey(): string | null {
+/**
+ * Resolves provider info from pi's model object.
+ * Returns baseUrl and apiKey for the provider.
+ */
+function resolveLLMConfig(model: Model | null | undefined): {
+  baseUrl: string;
+  modelId: string;
+  apiKey: string | null;
+} {
+  const provider = model?.provider ?? "";
+  const modelId = model?.id ?? "";
+
+  // Default fallback: OpenAI-compatible local/remote endpoint
+  let baseUrl = "https://opencode.ai/zen/v1";
+  let apiKey: string | null = null;
+
+  // Read auth.json once
+  let auth: Record<string, any> = {};
   try {
     const authPath = join(homedir(), ".pi", "agent", "auth.json");
     if (existsSync(authPath)) {
-      const auth = JSON.parse(readFileSync(authPath, "utf-8"));
-      // Try opencode first, then fall back to env var
-      const key = auth.opencode?.access ?? process.env.OPENCODE_API_KEY;
-      if (key && typeof key === "string" && key.length > 10) return key;
+      auth = JSON.parse(readFileSync(authPath, "utf-8"));
     }
-    return process.env.OPENCODE_API_KEY ?? null;
-  } catch {
-    return process.env.OPENCODE_API_KEY ?? null;
+  } catch {}
+
+  // Try to match provider
+  if (!provider) {
+    // No provider info — try env vars
+    apiKey = process.env.OPENAI_API_KEY
+      ?? process.env.ANTHROPIC_API_KEY
+      ?? process.env.OPENCODE_API_KEY
+      ?? null;
+    if (process.env.OPENAI_BASE_URL) baseUrl = process.env.OPENAI_BASE_URL;
+  } else if (provider === "opencode" || provider === "opencode-go") {
+    baseUrl = "https://opencode.ai/zen/v1";
+    apiKey = auth.opencode?.access ?? process.env.OPENCODE_API_KEY ?? null;
+  } else if (provider === "anthropic") {
+    baseUrl = "https://api.anthropic.com/v1";
+    apiKey = auth.anthropic?.access
+      ?? process.env.ANTHROPIC_API_KEY
+      ?? auth.anthropic?.apiKey
+      ?? null;
+  } else if (provider === "openai") {
+    baseUrl = process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+    apiKey = auth.openai?.access
+      ?? process.env.OPENAI_API_KEY
+      ?? auth.openai?.apiKey
+      ?? null;
+  } else if (provider === "kilo") {
+    baseUrl = auth.kilo?.access
+      ? "https://api.kilo.ai/api/openrouter"
+      : "https://opencode.ai/zen/v1";
+    apiKey = auth.kilo?.access ?? process.env.KILO_API_KEY ?? null;
+  } else if (provider === "google" || provider === "google-generative-ai") {
+    baseUrl = "https://generativelanguage.googleapis.com/v1beta";
+    apiKey = process.env.GEMINI_API_KEY ?? null;
+  } else if (provider === "ollama") {
+    baseUrl = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/v1";
+    apiKey = "ollama"; // Ollama ignores API key
+  } else {
+    // Unknown provider — try env vars
+    apiKey = process.env.OPENAI_API_KEY
+      ?? process.env.OPENCODE_API_KEY
+      ?? null;
+    if (process.env.OPENAI_BASE_URL) baseUrl = process.env.OPENAI_BASE_URL;
+  }
+
+  // If we still don't have an API key, try the stored auth providers
+  if (!apiKey) {
+    for (const p of ["opencode", "openai", "anthropic", "kilo"] as const) {
+      const cred = auth[p];
+      if (cred?.access) { apiKey = cred.access; break; }
+      if (cred?.apiKey) { apiKey = cred.apiKey; break; }
+    }
+  }
+
+  return { baseUrl, modelId: modelId || "deepseek-v4-flash-free", apiKey };
+}
+
+/**
+ * Calls the LLM using the provider-agnostic OpenAI-compatible chat completions format.
+ * Falls back gracefully if the provider doesn't support it.
+ */
+async function callLLM(
+  config: { baseUrl: string; modelId: string; apiKey: string | null },
+  systemPrompt: string,
+  userMessage: string,
+): Promise<string | null> {
+  if (!config.apiKey) {
+    console.warn("[phoenix-learner] No API key available for LLM analysis — skipping");
+    return null;
+  }
+
+  // Build the endpoint URL
+  // OpenAI-compatible: {baseUrl}/chat/completions
+  // Anthropic needs special handling — skip, use openai-compat only
+  const isAnthropic = config.baseUrl.includes("anthropic.com");
+  const url = isAnthropic
+    ? `${config.baseUrl}/messages`
+    : config.baseUrl.replace(/\/+$/, "") + "/chat/completions";
+
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (isAnthropic) {
+      headers["x-api-key"] = config.apiKey!;
+      headers["anthropic-version"] = "2023-06-01";
+    } else {
+      headers["Authorization"] = `Bearer ${config.apiKey}`;
+    }
+
+    const body = isAnthropic
+      ? {
+          model: config.modelId,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userMessage }],
+          max_tokens: 2000,
+          temperature: 0.1,
+        }
+      : {
+          model: config.modelId,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userMessage },
+          ],
+          max_tokens: 2000,
+          temperature: 0.1,
+        };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      console.warn(`[phoenix-learner] LLM call failed (${response.status}): ${text.slice(0, 200)}`);
+      return null;
+    }
+
+    const data = (await response.json()) as any;
+
+    if (isAnthropic) {
+      const content = data?.content?.[0]?.text;
+      return typeof content === "string" ? content : null;
+    }
+
+    const content = data?.choices?.[0]?.message?.content;
+    return typeof content === "string" ? content : null;
+  } catch (e) {
+    console.warn(`[phoenix-learner] LLM call error: ${e instanceof Error ? e.message : e}`);
+    return null;
   }
 }
 
-const ANALYSIS_PROMPT = `Jsi expert na analýzu konverzací AI coding agentů. 
+// =============================================================================
+// LLM Analysis
+// =============================================================================
+
+interface LLMFinding {
+  category: LessonCategory;
+  summary: string;
+  detail: string;
+  advice: string;
+}
+
+interface LLMAnalysisResult {
+  findings: LLMFinding[];
+}
+
+const ANALYSIS_PROMPT = `Jsi expert na analýzu konverzací AI coding agentů.
 Analyzuj následující konverzaci mezi uživatelem a AI agentem.
 Hledej tyto typy problémů:
 
@@ -317,61 +455,20 @@ Pokud není žádný problém, vrať: {"findings": []}
 Vrať výsledek jako platné JSON:
 {"findings": [{"category": "...", "summary": "...", "detail": "...", "advice": "..."}]}`;
 
-interface LLMFinding {
-  category: LessonCategory;
-  summary: string;
-  detail: string;
-  advice: string;
-}
-
-interface LLMAnalysisResult {
-  findings: LLMFinding[];
-}
-
-async function analyzeWithLLM(transcript: string): Promise<LLMFinding[]> {
-  const apiKey = getApiKey();
-  if (!apiKey) {
-    console.warn("[phoenix-learner] No API key for LLM analysis");
-    return [];
-  }
+async function analyzeWithLLM(
+  transcript: string,
+  model: Model | null | undefined,
+): Promise<LLMFinding[]> {
+  const config = resolveLLMConfig(model);
+  const content = await callLLM(config, ANALYSIS_PROMPT, transcript);
+  if (!content) return [];
 
   try {
-    const response = await fetch(`${OPENCODE_API_BASE}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: ANALYSIS_MODEL,
-        messages: [
-          { role: "system", content: ANALYSIS_PROMPT },
-          { role: "user", content: transcript },
-        ],
-        temperature: 0.1,
-        max_tokens: 2000,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      console.warn(`[phoenix-learner] LLM analysis failed: ${response.status} ${body.slice(0, 200)}`);
-      return [];
-    }
-
-    const data = (await response.json()) as any;
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) return [];
-
-    // Parse JSON from response
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return [];
-
     const result = JSON.parse(jsonMatch[0]) as LLMAnalysisResult;
     return result.findings ?? [];
-  } catch (e) {
-    console.warn(`[phoenix-learner] LLM analysis error: ${e instanceof Error ? e.message : e}`);
+  } catch {
     return [];
   }
 }
@@ -382,6 +479,7 @@ async function analyzeWithLLM(transcript: string): Promise<LLMFinding[]> {
 
 let lessons: Lesson[] = [];
 let analyzedTraceIds: Set<string> = new Set();
+let currentModel: Model | null | undefined = null;
 
 // =============================================================================
 // Extension Entry Point
@@ -392,12 +490,15 @@ export default async function (pi: ExtensionAPI) {
   console.log(`[phoenix-learner] Loaded ${lessons.length} lessons from ${LESSONS_PATH}`);
 
   // ── before_agent_start ──────────────────────────────────────────────
-  // Inject lessons into system prompt
-  pi.on("before_agent_start", async (event, _ctx) => {
+  // Track current model + inject lessons into system prompt
+  pi.on("before_agent_start", async (event, ctx) => {
+    // Store current model for later analysis
+    currentModel = ctx.model;
+
+    // Inject lessons
     lessons = loadLessons();
     if (lessons.length === 0) return;
 
-    // Sort: most frequent + most recent first
     const sorted = [...lessons].sort((a, b) => {
       if (a.count !== b.count) return b.count - a.count;
       return new Date(b.last_seen).getTime() - new Date(a.last_seen).getTime();
@@ -405,18 +506,14 @@ export default async function (pi: ExtensionAPI) {
 
     const active = sorted.slice(0, MAX_LESSONS_IN_PROMPT);
 
-    const lessonLines = active.map((l, i) => {
-      const icon: Record<string, string> = {
-        task_misunderstanding: "🎯",
-        context_loss: "🔄",
-        incomplete_info: "🔍",
-        verification_failure: "✅",
-        tool_misuse: "🔧",
-        premature_conclusion: "⚡",
-        chain_error: "⛓️",
-        instruction_ignored: "⚠️",
-        other: "💡",
-      };
+    const icon: Record<string, string> = {
+      task_misunderstanding: "🎯", context_loss: "🔄",
+      incomplete_info: "🔍", verification_failure: "✅",
+      tool_misuse: "🔧", premature_conclusion: "⚡",
+      chain_error: "⛓️", instruction_ignored: "⚠️", other: "💡",
+    };
+
+    const lessonLines = active.map((l) => {
       const emoji = icon[l.category] ?? "💡";
       return `${emoji} **${l.summary}** _(${l.count}x)_`;
     });
@@ -437,14 +534,12 @@ export default async function (pi: ExtensionAPI) {
 
   // ── agent_end → auto-analyze ───────────────────────────────────────
   pi.on("agent_end", async (_event, _ctx) => {
-    // Short delay for spans to be ingested
     await new Promise((r) => setTimeout(r, 3000));
 
     try {
       const spans = await fetchSpans();
       if (spans.length === 0) return;
 
-      // Get latest trace
       const sorted = [...spans].sort(
         (a, b) => new Date(b.end_time).getTime() - new Date(a.end_time).getTime(),
       );
@@ -456,65 +551,36 @@ export default async function (pi: ExtensionAPI) {
         analyzedTraceIds = new Set([...analyzedTraceIds].slice(-100));
       }
 
-      // Filter spans for this trace
       const traceSpans = spans.filter((s) => s.context.trace_id === latestTraceId);
 
-      // 1) Heuristic analysis for obvious errors
-      const errorSpans = traceSpans.filter((s) => s.status_code === "ERROR");
-      const toolErrors = traceSpans.filter(
-        (s) => s.span_kind === "TOOL" && s.status_code === "ERROR",
-      );
-
+      // 1) Heuristic: tool errors
       let hasFindings = false;
-
-      for (const es of errorSpans) {
+      for (const es of traceSpans.filter((s) => s.status_code === "ERROR")) {
         const isTool = es.span_kind === "TOOL";
         const toolName = es.attributes?.["pi.tool_name"] ?? "";
-
         const summary = isTool
           ? `Nástroj ${toolName} selhal — před použitím ověř vstup`
-          : `Volání AI selhalo — zkontroluj parametry modelu`;
-
+          : `Volání AI selhalo`;
         const detail = es.status_message
           ? `${es.name}: ${es.status_message}`
           : `Chyba v ${es.name}`;
-
-        lessons = upsertLesson(
-          lessons,
-          isTool ? "tool_misuse" : "other",
-          summary,
-          detail.slice(0, 300),
-          latestTraceId,
-        );
+        lessons = upsertLesson(lessons, isTool ? "tool_misuse" : "other", summary, detail.slice(0, 300), latestTraceId);
         hasFindings = true;
       }
 
-      // 2) LLM-based behavioral analysis (for deeper issues)
+      // 2) LLM behavioral analysis (uses user's current model)
       const conversation = buildConversation(traceSpans);
       if (conversation && conversation.turns.length > 0) {
-        const findings = await analyzeWithLLM(conversation.fullTranscript);
-
+        const findings = await analyzeWithLLM(conversation.fullTranscript, currentModel);
         for (const f of findings) {
-          // Combine summary with advice for the lesson
-          const fullSummary = f.advice.startsWith(f.summary)
-            ? f.advice
-            : `${f.advice} (${f.summary})`;
-
-          lessons = upsertLesson(
-            lessons,
-            f.category,
-            fullSummary,
-            f.detail.slice(0, 300),
-            latestTraceId,
-          );
+          lessons = upsertLesson(lessons, f.category, f.advice, f.detail.slice(0, 300), latestTraceId);
           hasFindings = true;
         }
       }
 
       if (hasFindings) {
         saveLessons(lessons);
-        const newCount = lessons.length;
-        console.log(`[phoenix-learner] Saved ${newCount} lessons`);
+        console.log(`[phoenix-learner] Saved ${lessons.length} lessons`);
       }
     } catch (e) {
       console.warn(`[phoenix-learner] Error: ${e instanceof Error ? e.message : e}`);
@@ -534,7 +600,6 @@ export default async function (pi: ExtensionAPI) {
           return;
         }
 
-        // Group by trace_id
         const traceMap = new Map<string, PHSpan[]>();
         for (const s of spans) {
           const tid = s.context.trace_id;
@@ -546,25 +611,19 @@ export default async function (pi: ExtensionAPI) {
         let totalFindings = 0;
 
         for (const [traceId, traceSpans] of traceMap) {
-          // Heuristic
-          const errors = traceSpans.filter((s) => s.status_code === "ERROR");
-          for (const es of errors) {
+          for (const es of traceSpans.filter((s) => s.status_code === "ERROR")) {
             const isTool = es.span_kind === "TOOL";
             const toolName = es.attributes?.["pi.tool_name"] ?? "";
-            const summary = isTool
-              ? `Nástroj ${toolName} selhal`
-              : `Chyba v ${es.name}`;
+            const summary = isTool ? `Nástroj ${toolName} selhal` : `Chyba v ${es.name}`;
             lessons = upsertLesson(lessons, isTool ? "tool_misuse" : "other", summary, es.status_message?.slice(0, 300) ?? "", traceId);
             totalFindings++;
           }
 
-          // LLM analysis for recent traces
           const conv = buildConversation(traceSpans);
           if (conv && conv.turns.length > 0) {
-            const findings = await analyzeWithLLM(conv.fullTranscript);
+            const findings = await analyzeWithLLM(conv.fullTranscript, ctx.model);
             for (const f of findings) {
-              const fullSummary = f.advice;
-              lessons = upsertLesson(lessons, f.category, fullSummary, f.detail.slice(0, 300), traceId);
+              lessons = upsertLesson(lessons, f.category, f.advice, f.detail.slice(0, 300), traceId);
               totalFindings++;
             }
           }
@@ -590,30 +649,23 @@ export default async function (pi: ExtensionAPI) {
 
       const byCategory: Record<string, Lesson[]> = {};
       for (const l of lessons) {
-        if (!byCategory[l.category]) byCategory[l.category] = [];
-        byCategory[l.category].push(l);
+        (byCategory[l.category] ??= []).push(l);
       }
 
-      const lines: string[] = [];
       const icon: Record<string, string> = {
         task_misunderstanding: "🎯", context_loss: "🔄",
         incomplete_info: "🔍", verification_failure: "✅",
         tool_misuse: "🔧", premature_conclusion: "⚡",
         chain_error: "⛓️", instruction_ignored: "⚠️", other: "💡",
       };
-
       const catNames: Record<string, string> = {
-        task_misunderstanding: "Nepochopení úkolu",
-        context_loss: "Ztráta kontextu",
-        incomplete_info: "Neúplné informace",
-        verification_failure: "Neověření výsledků",
-        tool_misuse: "Špatné použití nástrojů",
-        premature_conclusion: "Předčasný závěr",
-        chain_error: "Řetězení chyb",
-        instruction_ignored: "Ignorování instrukcí",
-        other: "Ostatní",
+        task_misunderstanding: "Nepochopení úkolu", context_loss: "Ztráta kontextu",
+        incomplete_info: "Neúplné informace", verification_failure: "Neověření výsledků",
+        tool_misuse: "Špatné použití nástrojů", premature_conclusion: "Předčasný závěr",
+        chain_error: "Řetězení chyb", instruction_ignored: "Ignorování instrukcí", other: "Ostatní",
       };
 
+      const lines: string[] = [];
       for (const [cat, items] of Object.entries(byCategory)) {
         lines.push(`\n${icon[cat] ?? "💡"} ${catNames[cat] ?? cat} (${items.length}):`);
         for (const l of items) {
@@ -632,14 +684,10 @@ export default async function (pi: ExtensionAPI) {
     description: "Smaže lesson (podle ID) nebo všechny (--all)",
     handler: async (args, ctx) => {
       const a = args?.trim();
-      if (!a) {
-        ctx.ui.notify("Použití: /forget-lesson <id> nebo /forget-lesson --all", "info");
-        return;
-      }
+      if (!a) { ctx.ui.notify("Použití: /forget-lesson <id> nebo /forget-lesson --all", "info"); return; }
 
       if (a === "--all") {
-        lessons = [];
-        saveLessons(lessons);
+        lessons = []; saveLessons(lessons);
         ctx.ui.notify("🗑️ Všechny lessons smazány", "info");
         return;
       }
@@ -661,7 +709,7 @@ export default async function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const entries = ctx.sessionManager.getEntries()
         .filter((e: any) => e.type === "message")
-        .slice(-20); // Last 20 messages
+        .slice(-20);
 
       if (entries.length < 2) {
         ctx.ui.notify("📝 Konverzace je příliš krátká na analýzu", "info");
@@ -670,8 +718,7 @@ export default async function (pi: ExtensionAPI) {
 
       ctx.ui.notify("🔍 Analyzuji konverzaci...", "info");
 
-      // Build transcript from session
-      const transcriptLines: string[] = ["## Aktuální konverzace"];
+      const lines: string[] = ["## Aktuální konverzace"];
       for (const entry of entries) {
         if (entry.type !== "message") continue;
         const msg = entry.message;
@@ -680,14 +727,10 @@ export default async function (pi: ExtensionAPI) {
           ?.filter((p: any) => p.type === "text")
           ?.map((p: any) => p.text)
           ?.join("\n") ?? "";
-        if (text) {
-          transcriptLines.push(`### ${role}`);
-          transcriptLines.push(text.slice(0, 1500));
-        }
+        if (text) lines.push(`### ${role}\n${text.slice(0, 1500)}`);
       }
 
-      const transcript = transcriptLines.join("\n");
-      const findings = await analyzeWithLLM(transcript);
+      const findings = await analyzeWithLLM(lines.join("\n"), ctx.model);
 
       if (findings.length === 0) {
         ctx.ui.notify("✅ Konverzace vypadá v pořádku, žádné problémy", "success");
@@ -701,19 +744,16 @@ export default async function (pi: ExtensionAPI) {
         chain_error: "⛓️", instruction_ignored: "⚠️", other: "💡",
       };
 
-      const lines: string[] = ["📋 Nálezy z review:"];
+      const resultLines: string[] = ["📋 Nálezy z review:"];
       for (const f of findings) {
-        lines.push(`\n${icon[f.category] ?? "💡"} **${f.summary}**`);
-        lines.push(`   ${f.detail}`);
-        lines.push(`   ➡️ ${f.advice}`);
-
-        // Auto-save to lessons
-        const fullSummary = f.advice;
-        lessons = upsertLesson(lessons, f.category, fullSummary, f.detail.slice(0, 300), "session-review");
+        resultLines.push(`\n${icon[f.category] ?? "💡"} **${f.summary}**`);
+        resultLines.push(`   ${f.detail}`);
+        resultLines.push(`   ➡️ ${f.advice}`);
+        lessons = upsertLesson(lessons, f.category, f.advice, f.detail.slice(0, 300), "session-review");
       }
 
       saveLessons(lessons);
-      ctx.ui.notify(lines.join("\n"), "info");
+      ctx.ui.notify(resultLines.join("\n"), "info");
     },
   });
 }
