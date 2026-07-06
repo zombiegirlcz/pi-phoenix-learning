@@ -1,0 +1,9 @@
+{
+  "defaultModel": "deepseek-v4-flash-free",
+  "defaultProvider": "opencode",
+  "defaultThinkingLevel": "medium",
+  "theme": "dark",
+  "packages": [
+    "git:github.com/pi-phoenix-learning/pi-phoenix-learning"
+  ]
+}

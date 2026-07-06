@@ -1,0 +1,29 @@
+{
+  "name": "pi-phoenix-learning",
+  "version": "1.0.0",
+  "description": "Pi package: Phoenix tracing + self-improving agent that learns from mistakes. Traces every agent call to Arize Phoenix and automatically extracts lessons for continuous improvement.",
+  "keywords": [
+    "pi-package",
+    "phoenix",
+    "tracing",
+    "observability",
+    "learning",
+    "arize"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "author": "Pi Phoenix Learning",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pi-phoenix-learning/pi-phoenix-learning.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/phoenix-tracer.ts",
+      "./extensions/phoenix-learner.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.78.0"
+  }
+}
