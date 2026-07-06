@@ -90,7 +90,7 @@ pi install /path/to/pi-phoenix-learning
 | `PHOENIX_HOST` | `http://localhost:6006` | Phoenix server URL |
 | `PHOENIX_PROJECT` | `pi` | Název projektu v Phoenixu |
 | `PHOENIX_API_KEY` | *(prázdné)* | API key pro Phoenix (volitelné) |
-| `PHOENIX_LEARNER_MODEL` | `deepseek-v4-flash-free` | Model pro LLM analýzu |
+| `PHOENIX_LEARNER_MODEL` | *(aktuální model v pi)* | Model pro LLM analýzu (přepíše automatický výběr) |
 
 ### Pi settings (`~/.pi/agent/settings.json`)
 
@@ -161,7 +161,8 @@ pi-phoenix-learning/
 
 - **Pi** >= 0.78.0 (extension API)
 - **Arize Phoenix** — viz výše (Python package)
-- **OpenCode** subscription (nebo vlastní provider) — pro LLM analýzu
+- **API klíč** pro LLM analýzu — použije se provider/model který máš aktivní v pi
+- Podporovaní: OpenCode, OpenAI, Anthropic, Kilo, Google, Ollama, nebo vlastní přes `OPENAI_BASE_URL`
 
 ## 🩺 Troubleshooting
 
