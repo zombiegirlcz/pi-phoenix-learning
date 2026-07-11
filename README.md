@@ -65,7 +65,7 @@ Ověř že běží: `curl http://localhost:6006/health` → `200`
 ### 2. Pi package
 
 ```bash
-pi install git:github.com/pi-phoenix-learning/pi-phoenix-learning
+pi install git:github.com/zombiegirlcz/pi-phoenix-learning
 ```
 
 Nebo lokálně:
