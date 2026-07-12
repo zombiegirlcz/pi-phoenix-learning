@@ -1,9 +1,10 @@
 {
   "name": "pi-phoenix-learning",
   "version": "1.0.0",
-  "description": "Pi package: Phoenix tracing + self-improving agent that learns from mistakes. Traces every agent call to Arize Phoenix and automatically extracts lessons for continuous improvement.",
+  "description": "Pi package: Phoenix tracing + self-improving agent that learns from mistakes. Traces every agent call to Arize Phoenix and automatically extracts lessons for continuous improvement. Also supports GitHub Copilot CLI.",
   "keywords": [
     "pi-package",
+    "copilot",
     "phoenix",
     "tracing",
     "observability",
@@ -17,13 +18,27 @@
     "type": "git",
     "url": "git+https://github.com/pi-phoenix-learning/pi-phoenix-learning.git"
   },
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "type-check:watch": "tsc --noEmit --watch"
+  },
   "pi": {
     "extensions": [
+      "./extensions/unified-phoenix-extension.ts",
       "./extensions/phoenix-tracer.ts",
       "./extensions/phoenix-learner.ts"
     ]
   },
+  "copilot": {
+    "extensions": [
+      "./extensions/unified-phoenix-extension.ts"
+    ]
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.78.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
   }
 }

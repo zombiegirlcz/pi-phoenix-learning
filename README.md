@@ -1,15 +1,15 @@
 # 🧠 pi-phoenix-learning
 
-**Self-improving Pi agent.** Traces every agent call to [Arize Phoenix](https://phoenix.arize.com) for observability, then automatically analyzes conversations to extract lessons — so your agent gets smarter over time.
+**Self-improving agents.** Traces every Pi and Copilot CLI call to [Arize Phoenix](https://phoenix.arize.com) for observability, then automatically analyzes conversations to extract lessons — so your agents get smarter over time.
 
 ```
-User prompt  ──►  pi agent  ──►  phoenix-tracer  ──►  Phoenix (traces)
+User prompt  ──►  pi agent or copilot cli  ──►  phoenix-tracer  ──►  Phoenix (traces)
                          │
                          ▼
-                   phoenix-learner ◄────── reads spans
+                   unified-phoenix-extension ◄─ reads spans
                          │
                          ▼
-              pi-lessons.json ◄────── stores lessons
+         pi-lessons.json or copilot-lessons.json ◄── stores lessons
                          │
                          ▼
               injected into system prompt
@@ -20,10 +20,11 @@ User prompt  ──►  pi agent  ──►  phoenix-tracer  ──►  Phoenix 
 
 | Komponenta | Popis |
 |---|---|
-| **🔭 phoenix-tracer** | Zachytává každé volání pi agenta a posílá spans do Phoenixu |
+| **🔭 phoenix-tracer** | Zachytává každé volání pi agenta nebo Copilot CLI a posílá spans do Phoenixu |
 | **🧠 phoenix-learner** | Analyzuje tracy pomocí LLM, hledá chyby a ukládá ponaučení |
-| **💾 Globální paměť** | Lessons se ukládají do `~/.pi/agent/pi-lessons.json` |
+| **💾 Globální paměť** | Lessons se ukládají do `~/.pi/agent/pi-lessons.json` (Pi) nebo `~/.copilot/copilot-lessons.json` (Copilot) |
 | **🔌 Injekce do promptu** | Před každým agent_start se lessons přidají do system promptu |
+| **🔀 Unifikované rozšíření** | Jeden extension kód pro oba agenty, detekuje agenta automaticky |
 
 ### Sledované kategorie chyb
 
@@ -74,23 +75,37 @@ Nebo lokálně:
 pi install /path/to/pi-phoenix-learning
 ```
 
-### 3. Restart pi
+### 2. Copilot CLI (experimentální)
 
 ```bash
-/reload
-# nebo spusť pi znovu
+copilot install /path/to/pi-phoenix-learning
+```
+
+### 3. Restart
+
+```bash
+/reload  # for Pi
 ```
 
 ## 🔧 Konfigurace
 
-### Environment variables
+### Environment variables (Pi)
 
 | Proměnná | Výchozí | Popis |
 |---|---|---|
 | `PHOENIX_HOST` | `http://localhost:6006` | Phoenix server URL |
 | `PHOENIX_PROJECT` | `pi` | Název projektu v Phoenixu |
 | `PHOENIX_API_KEY` | *(prázdné)* | API key pro Phoenix (volitelné) |
-| `PHOENIX_LEARNER_MODEL` | *(aktuální model v pi)* | Model pro LLM analýzu (přepíše automatický výběr) |
+| `PI_LESSONS_PATH` | `~/.pi/agent/pi-lessons.json` | Vlastní cesta k Pi lessons |
+
+### Environment variables (Copilot CLI)
+
+| Proměnná | Výchozí | Popis |
+|---|---|---|
+| `PHOENIX_HOST` | `http://localhost:6006` | Phoenix server URL |
+| `COPILOT_PHOENIX_PROJECT` | `copilot` | Název projektu v Phoenixu pro Copilot |
+| `COPILOT_LESSONS_PATH` | `~/.copilot/copilot-lessons.json` | Vlastní cesta k Copilot lessons |
+| `PHOENIX_API_KEY` | *(prázdné)* | API key pro Phoenix (volitelné) |
 
 ### Pi settings (`~/.pi/agent/settings.json`)
 
@@ -144,13 +159,21 @@ Po instalaci máš k dispozici tyhle `/` příkazy:
 
 ```
 pi-phoenix-learning/
-├── package.json                      # Pi package manifest
+├── package.json                      # Pi/Copilot package manifest
+├── tsconfig.json                     # TypeScript configuration
 ├── README.md                         # Tento soubor
 ├── LICENSE                           # MIT
 ├── .gitignore
 ├── extensions/
-│   ├── phoenix-tracer.ts             # Tracing extension
-│   └── phoenix-learner.ts            # Learning extension
+│   ├── unified-phoenix-extension.ts  # Unifikované extension (Pi + Copilot)
+│   ├── phoenix-tracer.ts             # Original Pi tracing extension
+│   └── phoenix-learner.ts            # Original Pi learning extension
+├── lib/
+│   ├── span-builder.ts               # Shared span building utilities
+│   ├── phoenix-api.ts                # Multi-project Phoenix API
+│   ├── lesson-storage.ts             # Lesson persistence
+│   ├── llm-provider.ts               # Provider-agnostic LLM calls
+│   └── lesson-analyzer.ts            # Conversation analysis & extraction
 ├── scripts/
 │   └── setup-phoenix.sh              # Phoenix server launcher
 └── config/
@@ -180,11 +203,83 @@ Zkontroluj `PHOENIX_HOST` proměnnou. Výchozí je `http://localhost:6006`.
 2. Zkontroluj `pi-lessons.json`: `cat ~/.pi/agent/pi-lessons.json`
 3. Ověř API klíč: `echo $OPENCODE_API_KEY`
 
+## 🦅 GitHub Copilot CLI Support
+
+Stejné tracing + learning capabilities jsou dostupné i pro **GitHub Copilot CLI** (ne VS Code, jen CLI).
+
+### Setup v 5 krocích
+
+```bash
+# 1. Stáhni repository
+git clone https://github.com/zombiegirlcz/pi-phoenix-learning.git /root/pi-phoenix-learning
+
+# 2. Instaluj dependencies
+cd /root/pi-phoenix-learning && npm install
+
+# 3. Přidej extension do Copilot settings.json
+jq '.extensions.directories += ["/root/pi-phoenix-learning/extensions"] |
+    .extensions.mode = "load_and_augment"' \
+  ~/.copilot/settings.json > ~/.copilot/settings.json.tmp && \
+  mv ~/.copilot/settings.json.tmp ~/.copilot/settings.json
+
+# 4. Spusť Phoenix server
+docker run -d --name phoenix -p 6006:6006 arizephoenix/phoenix:latest
+
+# 5. Restartuj Copilot
+pkill copilot
+copilot -p "Ahoj, jsem připravený se učit"
+```
+
+### Ověření
+
+```bash
+# Zkontroluj, zda se vytv ořily lekce
+cat ~/.copilot/copilot-lessons.json | jq .
+
+# Zkontroluj Phoenix UI
+curl -s http://localhost:6006/v1/projects/copilot/spans | jq '.data | length'
+
+# Měl bys vidět traces v http://localhost:6006 → projekt "copilot"
+```
+
+### Copilot vs. Pi: Oddělená úložiště
+
+| Komponenta | Pi | Copilot |
+|---|---|---|
+| **Lekce** | `~/.pi/agent/pi-lessons.json` | `~/.copilot/copilot-lessons.json` |
+| **Phoenix projekt** | `pi` | `copilot` |
+| **Env prefix** | `PHOENIX_` | `COPILOT_` |
+| **Extension** | via `pi install` | via settings.json |
+
+Copilot se **učí svou vlastní historií**, nezavírá se jím lekce z Pi a naopak.
+
+### Troubleshooting Copilot
+
+```bash
+# Extension se nenačítá?
+copilot --logLevel debug -p "test" 2>&1 | grep -i "error\|extension"
+
+# Lekce se nevytváří?
+curl -s http://localhost:6006/v1/projects/copilot/spans | jq '.data | length'
+
+# Ověř auth pro LLM
+cat ~/.copilot/auth.json 2>/dev/null | jq .
+
+# Všechny lekce vyresetuj
+rm ~/.copilot/copilot-lessons.json
+```
+
+**Přečti si podrobný průvodce:** [SETUP_GUIDE_CZ.md](./SETUP_GUIDE_CZ.md)
+
 ## 📊 Phoenix UI
 
-Otevři http://localhost:6006 — uvidíš projekt `pi` se všemi tracy:
+Otevři http://localhost:6006 — uvidíš oddělené projekty:
 
-- Každý agent request = jedna trace
+- **Pi project** (`pi`) — traces pro Pi agent
+- **Copilot project** (`copilot`) — traces pro Copilot CLI
+
+V každém projektu:
+- Každý request = jedna trace
 - Spans: agent (CHAIN) → turn (LLM) → tool calls (TOOL)
 - V atributech: prompt, odpověď, tool vstup/výstup, token counts
 
